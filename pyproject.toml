@@ -1,0 +1,24 @@
+[project]
+name = "youtube-mcp"
+version = "0.1.0"
+description = "Local MCP server that lets Claude read and watch YouTube videos"
+readme = "README.md"
+authors = [
+    { name = "youssefhassan4002", email = "youssefgamer203@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "imageio-ffmpeg>=0.6.0",
+    "mcp>=1.10",
+    "numpy>=2.5.3",
+    "youtube-transcript-api>=1.2",
+    "yt-dlp[default]>=2026.8.19",
+]
+
+[project.scripts]
+youtube-mcp = "youtube_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.12.20,<0.13.0"]
+build-backend = "uv_build"
