@@ -24,11 +24,13 @@ for noisy in ("httpx", "huggingface_hub", "faster_whisper"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("youtube_mcp")
 
-MAX_TRANSCRIPT_CHARS = int(os.environ.get("YOUTUBE_MCP_MAX_TRANSCRIPT_CHARS", 40_000))
+MAX_TRANSCRIPT_CHARS = int(os.environ.get("YOUTUBE_MCP_MAX_TRANSCRIPT_CHARS", 80_000))  # ~1 hour of fast speech
 MAX_FRAMES_HARD = int(os.environ.get("YOUTUBE_MCP_MAX_FRAMES", 40))
 FRAME_WIDTH = int(os.environ.get("YOUTUBE_MCP_FRAME_WIDTH", 512))
 FRAME_JPEG_QUALITY = 5  # ffmpeg -q:v scale, 2 (best) .. 31 (worst)
-MAX_IMAGE_BYTES = int(os.environ.get("YOUTUBE_MCP_MAX_IMAGE_BYTES", 750_000))  # total raw JPEG bytes per call
+# Claude Desktop rejects tool results over 1 MB ("Tool result is too large"). Text plus base64-encoded
+# images in one response must fit under this, which leaves headroom for JSON overhead.
+MAX_RESPONSE_BYTES = int(os.environ.get("YOUTUBE_MCP_MAX_RESPONSE_BYTES", 900_000))
 MAX_DESCRIPTION_CHARS = 5_000
 
 TimeArg = str | float | None
@@ -85,27 +87,25 @@ def _plan_timestamps(start: float, end: float, interval: float, max_frames: int)
 
 
 def _load_frames(video_id: str, timestamps: list[float]) -> tuple[list[tuple[float, bytes]], list[str]]:
-    """Extract frames and apply the total image byte budget. Returns ((t, jpeg), ...) and notes."""
-    notes = []
+    """Extract frames. Returns ((t, jpeg), ...) and notes about any that failed."""
     results = extract_frames(video_id, timestamps, FRAME_WIDTH, FRAME_JPEG_QUALITY)
     failed = [t for t, p in results if p is None]
-    if failed:
-        notes.append(f"Could not extract frames at: {', '.join(fmt_time(t) for t in failed)}.")
-    frames, total = [], 0
-    for t, path in results:
-        if path is None:
-            continue
-        data = path.read_bytes()
-        if frames and total + len(data) > MAX_IMAGE_BYTES:
-            dropped = [fmt_time(x) for x, p in results if p is not None and x >= t]
-            notes.append(
-                f"Image size budget ({MAX_IMAGE_BYTES // 1000} KB) reached: dropped {len(dropped)} frame(s) "
-                f"from {dropped[0]} onward. Request a narrower range to see them."
+    notes = [f"Could not extract frames at: {', '.join(fmt_time(t) for t in failed)}."] if failed else []
+    return [(t, p.read_bytes()) for t, p in results if p is not None], notes
+
+
+def _fit_frames(frames: list[tuple[float, bytes]], text_bytes: int) -> tuple[list[tuple[float, bytes]], str | None]:
+    """Keep frames, in order, while the text plus base64-encoded images stays under MAX_RESPONSE_BYTES."""
+    used = text_bytes
+    for i, (t, data) in enumerate(frames):
+        used += (len(data) + 2) // 3 * 4 + 200  # base64 size, plus the frame's label and JSON wrapper
+        if used > MAX_RESPONSE_BYTES:
+            return frames[:i], (
+                f"Response size limit ({MAX_RESPONSE_BYTES // 1000} KB; Claude Desktop rejects tool results over "
+                f"1 MB) reached: dropped {len(frames) - i} frame(s) from {fmt_time(t)} onward. Request a "
+                f"narrower range to see them."
             )
-            break
-        frames.append((t, data))
-        total += len(data)
-    return frames, notes
+    return frames, None
 
 
 def _range_label(start: float, end: float, duration: float | None) -> str:
@@ -116,6 +116,16 @@ def _range_label(start: float, end: float, duration: float | None) -> str:
 def _transcript_segments(video_id: str, start: float, end: float, duration, language) -> tuple[list[dict], str]:
     t = tr.get_transcript(video_id, end, duration, language)
     return tr.segments_in_range(t, start, end), t.source
+
+
+def _cap_lines(lines: list[tuple[float, str]], used: int = 0) -> tuple[list[tuple[float, str]], float | None]:
+    """Keep transcript lines up to MAX_TRANSCRIPT_CHARS. Returns the kept lines and the time of the
+    first line left out (None if everything fit). Always keeps at least one line."""
+    for i, (t, line) in enumerate(lines):
+        if i and used + len(line) + 1 > MAX_TRANSCRIPT_CHARS:
+            return lines[:i], t
+        used += len(line) + 1
+    return lines, None
 
 
 def _truncation_note(stopped_at: float, end: float, url: str) -> str:
@@ -179,13 +189,10 @@ async def get_transcript(url: str, start: TimeArg = None, end: TimeArg = None, l
     header = f"Transcript of \"{info['title']}\" — {_range_label(s, e, duration)}\nSource: {source}\n"
     if not lines:
         return header + "\n(no speech found in this range)"
-    body, used = [], len(header)
-    for t, line in lines:
-        if body and used + len(line) + 1 > MAX_TRANSCRIPT_CHARS:  # always return at least one line
-            body.append(_truncation_note(t, e, url))
-            break
-        body.append(line)
-        used += len(line) + 1
+    kept, stopped_at = _cap_lines(lines, used=len(header))
+    body = [line for _, line in kept]
+    if stopped_at is not None:
+        body.append(_truncation_note(stopped_at, e, url))
     return header + "\n" + "\n".join(body)
 
 
@@ -215,6 +222,9 @@ async def get_frames(
     s, e = resolve_range(start, end, duration)
     timestamps, cap_note = _plan_timestamps(s, e, interval_seconds, max_frames)
     frames, notes = await _run(_load_frames, video_id, timestamps)
+    frames, size_note = _fit_frames(frames, text_bytes=2_000)  # the header is the only other text
+    if size_note:
+        notes.append(size_note)
     if cap_note:
         notes.insert(0, cap_note)
 
@@ -282,6 +292,15 @@ async def watch_video(
         frames, frame_notes = results["frames"]
         notes += frame_notes
 
+    # Cap the transcript first; frames get whatever room is left in the response.
+    kept_lines, stopped_at = _cap_lines(tr.format_lines(segments))
+    if stopped_at is not None:
+        segments = [seg for seg in segments if seg["start"] < stopped_at]
+    text_bytes = sum(len(line.encode()) + 1 for _, line in kept_lines) + 3_000  # + header, notes, chapters
+    frames, size_note = _fit_frames(frames, text_bytes)
+    if size_note:
+        notes.append(size_note)
+
     chapters = [c for c in info["chapters"] if (c["end"] or e) > s and (c["start"] or 0) < e]
     header = [
         f"Watching \"{info['title']}\" by {info['channel']} — {_range_label(s, e, duration)}"
@@ -296,8 +315,7 @@ async def watch_video(
     # Interleave: each frame followed by the speech from its timestamp up to the next frame.
     # Speech before the first frame (or all of it, if there are no frames) goes in the first block.
     boundaries = [t for t, _ in frames] or [s]
-    used, truncated, emitted = len(content[0]), False, 0
-    si = 0
+    si, note_added = 0, False
     for i, start_t in enumerate(boundaries):
         next_t = boundaries[i + 1] if i + 1 < len(boundaries) else float("inf")
         if frames:
@@ -307,21 +325,14 @@ async def watch_video(
         while si < len(segments) and segments[si]["start"] < next_t:
             window.append(segments[si])
             si += 1
-        chunk = []
-        for t, line in tr.format_lines(window):
-            if truncated:
-                break
-            if emitted and used + len(line) + 1 > MAX_TRANSCRIPT_CHARS:
-                chunk.append(_truncation_note(t, e, url))
-                truncated = True
-                break
-            chunk.append(line)
-            used += len(line) + 1
-            emitted += 1
-        if chunk:
-            content.append("\n".join(chunk))
-        elif frames and segments and not truncated:
+        if window:
+            content.append("\n".join(line for _, line in tr.format_lines(window)))
+        elif frames and segments and (stopped_at is None or next_t <= stopped_at):
             content.append("(no speech in this segment)")
+        if stopped_at is not None and not note_added and next_t > stopped_at:
+            # The transcript was cut inside this window; later frames have no text in this response.
+            content.append(_truncation_note(stopped_at, e, url))
+            note_added = True
     if not segments and not isinstance(results["transcript"], Exception):
         content.append("(no speech found in this range)")
     return content

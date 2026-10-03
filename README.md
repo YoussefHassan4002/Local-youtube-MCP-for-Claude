@@ -19,18 +19,20 @@ Built with the official MCP Python SDK. With `mcp` v2 the high-level server clas
 
 ### Limits and truncation
 
-Responses are capped so they stay manageable. Whenever something is cut, the response says so explicitly:
+There's no limit on video length. The caps below apply to a single response, so one call can't flood the conversation. Longer videos just take more calls, and every truncated response tells Claude where to pick up. For example, the full transcript of a 1-hour talk comes back in one call.
 
-- **Transcript:** 40,000 characters per call. When a range is longer, the output ends with a `[TRUNCATED: … call get_transcript(url=…, start="12:34", end="30:00")]` line that tells Claude exactly where to continue.
+Whenever something is cut, the response says so explicitly:
+
+- **Transcript:** 80,000 characters per call. That's about an hour of fast speech (a 1-hour talk measured 66,883 characters, or roughly 17–20k tokens), and slower speakers fit more. When a range is longer, the output ends with a `[TRUNCATED: … call get_transcript(url=…, start="12:34", end="30:00")]` line that tells Claude exactly where to continue.
 - **Frames:** `max_frames` defaults to 20, with a hard limit of 40. If `interval_seconds` would need more frames than that, the frames are spread evenly across the range instead, and a `NOTE` gives the effective interval.
-- **Image bytes:** each call returns at most about 750 KB of JPEG data. Frames are 512 px wide and usually 10–30 KB each. Any frames past the budget are dropped, and a `NOTE` says which ones.
+- **Response size:** each response is kept under 900 KB in total, text plus images, because Claude Desktop rejects tool results over 1 MB. The transcript gets its space first and frames fill the rest. Frames are 512 px wide and usually 10–25 KB each, so 20–40 frames plus an hour of transcript fit comfortably. If frames ever don't fit, the later ones are dropped and a `NOTE` says which.
 - **Description:** 5,000 characters.
 
 If `watch_video` can't get the transcript or the frames, it still returns the other part, with a note explaining what failed.
 
 ### Caching
 
-Everything is cached under `$TMPDIR/youtube-mcp-cache/<video_id>/`: the metadata, the captions, the Whisper transcripts, the downloaded audio and video, and the extracted frames. Repeat calls return almost instantly. To clear the cache, delete that folder (`rm -rf "$TMPDIR/youtube-mcp-cache"`). macOS also clears it on its own over time.
+Everything is cached under `$TMPDIR/youtube-mcp-cache/<video_id>/`: the metadata, the captions, the Whisper transcripts, the downloaded audio and video, and the extracted frames. Repeat calls return almost instantly. The first frames call on a video downloads the whole video at 360p, which can take a minute or more for long videos (86 seconds for a 1-hour talk in testing). To clear the cache, delete that folder (`rm -rf "$TMPDIR/youtube-mcp-cache"`). macOS also clears it on its own over time.
 
 Whisper transcribes 10 minutes at a time and stops once it has covered the end of your range. A request for the first 5 minutes of a 2-hour video without captions therefore only transcribes the first 10 minutes. Later requests continue from where the last one stopped.
 
@@ -89,6 +91,8 @@ Then ask things like:
 claude mcp add youtube -- uv --directory "/path/to/Local youtube MCP for Claude" run youtube-mcp
 ```
 
+Claude Code limits each tool result to 25,000 tokens by default, and images count toward that. An hour of transcript fits. A `watch_video` call over a whole hour with many frames may not; if Claude Code complains, start it with a higher limit, for example `MAX_MCP_OUTPUT_TOKENS=50000 claude`.
+
 ## Configuration (optional)
 
 You can set these as environment variables, or in an `"env": {…}` block in the Claude Desktop config.
@@ -97,10 +101,10 @@ You can set these as environment variables, or in an `"env": {…}` block in the
 |---|---|---|
 | `YOUTUBE_MCP_CACHE_DIR` | `$TMPDIR/youtube-mcp-cache` | Cache location |
 | `YOUTUBE_MCP_WHISPER_MODEL` | `base` | faster-whisper model: `tiny`, `base`, `small`, `medium`, `large-v3`, … Larger models are more accurate and slower. |
-| `YOUTUBE_MCP_MAX_TRANSCRIPT_CHARS` | `40000` | Transcript characters per response |
+| `YOUTUBE_MCP_MAX_TRANSCRIPT_CHARS` | `80000` | Transcript characters per response |
 | `YOUTUBE_MCP_MAX_FRAMES` | `40` | Hard upper limit for `max_frames` |
 | `YOUTUBE_MCP_FRAME_WIDTH` | `512` | Frame width in pixels |
-| `YOUTUBE_MCP_MAX_IMAGE_BYTES` | `750000` | Total JPEG bytes per response |
+| `YOUTUBE_MCP_MAX_RESPONSE_BYTES` | `900000` | Total size of one response, text plus base64 images. Keep it under 1 MB for Claude Desktop. |
 | `YOUTUBE_MCP_COOKIES_FROM_BROWSER` | unset | For example `chrome` or `firefox`. Uses that browser's YouTube cookies for age-restricted or members-only videos. |
 
 ## Troubleshooting
